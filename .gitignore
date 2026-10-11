@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build artifacts (agent is compiled ON the box, not here)
+*.exe
+agent/err.txt
+
+# Host scratch
+*.log
+retroctl_agent.ini
+retroctl_agent.log
+
+# OS cruft
+.DS_Store
