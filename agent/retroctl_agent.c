@@ -46,6 +46,11 @@
 #ifndef LPSERVICE_STATUS_HANDLE
 #define LPSERVICE_STATUS_HANDLE SERVICE_STATUS_HANDLE *
 #endif
+/* Old MinGW headers sometimes omit the service-main function pointer type.
+ * Provide a fallback so the dispatcher table below always compiles. */
+#ifndef LPSERVICE_MAIN_FUNCTIONA
+#define LPSERVICE_MAIN_FUNCTIONA DWORD (WINAPI *)(DWORD, LPSTR *)
+#endif
 
 #define AGENT_VER  "1.0.0"
 #define DEF_PORT   46911
@@ -1275,13 +1280,26 @@ static int WINAPI svc_ctrl(DWORD code)
 /* The service path, driven from main() in the classic single-service style:
  * register the control handler, push START_PENDING -> RUNNING, serve, then
  * STOPPED.  No StartServiceCtrlDispatcher table needed. */
-static int run_service(void)
+/* Service-thread entry point, invoked by StartServiceCtrlDispatcher in its
+ * own thread.  RegisterServiceCtrlHandlerA is honoured by the SCM only from
+ * this service context, NOT from main() -- the legacy main-thread pattern
+ * was the 0x41d "not responding to control function" we hit on Win2000. */
+static DWORD WINAPI service_main(DWORD argc, LPSTR *argv)
 {
+    char lg[96];
+    DWORD e;
+    (void)argc;
+    (void)argv;
+
+    log_line("service thread entered");
     g_stopEvt = CreateEventA(NULL, TRUE, FALSE, NULL);
     g_hstat = z_RegHandler(SVC_KEY, svc_ctrl);
     if (!g_hstat)
     {
-        log_line("RegisterServiceCtrlHandler failed");
+        e = GetLastError();
+        sprintf(lg, "RegisterServiceCtrlHandler failed (gle=%lu)",
+                (unsigned long)e);
+        log_line(lg);
         return 1;
     }
     g_stat.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -1313,6 +1331,7 @@ static int run_service(void)
         g_stat.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
         g_stat.dwWaitHint = 0;
         if (z_SetStat) z_SetStat(g_hstat, &g_stat);
+        log_line("service RUNNING on listener");
         serve_loop();
         g_stat.dwCurrentState = SERVICE_STOPPED;
         g_stat.dwWaitHint = 0;
@@ -1325,6 +1344,37 @@ static int run_service(void)
         if (z_SetStat) z_SetStat(g_hstat, &g_stat);
     }
     W.WSACleanup();
+    return 0;
+}
+
+/* Launch the SCM dispatcher with a single-service table.  The dispatcher
+ * creates the service thread that runs service_main; it returns non-zero on
+ * success (a service-thread fatal error) or zero on dispatch failure. */
+static int run_service(void)
+{
+    char lg[96];
+    DWORD e;
+    /* Classic (ANSI, un-suffixed) service table type: the oldest form,
+     * present in every Win32 header including old MinGW-for-Win2000.  The
+     * newer SERVICE_TABLE_ENTRYA / LPSERVICE_MAIN_FUNCTIONA spellings are
+     * not guaranteed to exist in that toolchain. */
+    const SERVICE_TABLE_ENTRY table[2] = {
+        { (LPSTR)SVC_KEY, service_main },
+        { NULL, NULL }
+    };
+
+    if (!load_advapi() || !z_ScDispatcher)
+    {
+        log_line("advapi32 dispatcher unavailable, cannot run as service");
+        return 1;
+    }
+    log_line("service entered, launching dispatcher");
+    z_ScDispatcher(table);
+    /* Reaching here means a service thread called ReportServiceStatus with a
+     * terminal state.  Surface the last SCM error for the log. */
+    e = GetLastError();
+    sprintf(lg, "dispatcher returned (gle=%lu)", (unsigned long)e);
+    log_line(lg);
     return 0;
 }
 
