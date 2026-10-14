@@ -30,13 +30,22 @@
  * Config precedence: args > RETROCTL_PORT / RETROCTL_TOKEN env > ini next to
  * the exe > defaults (port 46911, token "changeme").
  * ========================================================================== */
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "wsock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* some very old MinGW builds of <windows.h> do not export the service
+ * control pointer typedef; provide a safe fallback so the advapi32
+ * function-pointer signatures below always compile. */
+#ifndef LPSERVICE_STATUS
+#define LPSERVICE_STATUS SERVICE_STATUS *
+#endif
+#ifndef LPSERVICE_STATUS_HANDLE
+#define LPSERVICE_STATUS_HANDLE SERVICE_STATUS_HANDLE *
+#endif
 
 #define AGENT_VER  "1.0.0"
 #define DEF_PORT   46911
@@ -86,10 +95,12 @@ static void log_line(const char *msg)
     FILE *f;
     char ts[32], line[512];
     time_t t = time(NULL);
-    struct tm tmv;
+    struct tm *tmptr = localtime(&t);
     if (!g_logpath[0]) return;
-    localtime_s(&tmv, &t);
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    if (tmptr)
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tmptr);
+    else
+        ts[0] = 0;
     sprintf(line, "%s %s\n", ts, msg);
     f = fopen(g_logpath, "a");
     if (f) { fputs(line, f); fclose(f); }
@@ -122,7 +133,7 @@ static void sb_addf(SB *s, const char *fmt, ...)
     va_list ap;
     char tmp[2048];
     va_start(ap, fmt);
-    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    vsprintf(tmp, fmt, ap);
     va_end(ap);
     sb_puts(s, tmp);
 }
@@ -198,13 +209,12 @@ static int load_wsock(void)
     W.recv            = (PFN_recv)           GetProcAddress(hws, "recv");
     W.send            = (PFN_send)           GetProcAddress(hws, "send");
     W.closesocket     = (PFN_closesocket)    GetProcAddress(hws, "closesocket");
-    W.ioctlsocket     = (PFN_ioctlsocket)    GetProcAddress(hws, "ioctlsocket");
     W.htons           = (PFN_htons)          GetProcAddress(hws, "htons");
     W.htonl           = (PFN_htonl)          GetProcAddress(hws, "htonl");
     W.inet_ntoa       = (PFN_inet_ntoa)      GetProcAddress(hws, "inet_ntoa");
     return (W.WSAStartup && W.socket && W.bind && W.listen && W.accept &&
             W.recv && W.send && W.closesocket && W.htons && W.htonl &&
-            W.inet_ntoa && W.ioctlsocket);
+            W.inet_ntoa);
 }
 
 /* toolhelp32 process enumeration (absent from the old MinGW import table). */
@@ -235,7 +245,7 @@ typedef SC_HANDLE (WINAPI *fn_CR)(SC_HANDLE, LPCSTR, LPCSTR, DWORD, DWORD,
                                   DWORD, DWORD, LPSTR, LPCSTR, LPDWORD,
                                   LPSTR, LPSTR, LPSTR);
 typedef int       (WINAPI *fn_St)(SC_HANDLE, int, LPCSTR);
-typedef int       (WINAPI *fn_SS)(LPSERVICE_STATUS_HANDLE, LPSERVICE_STATUS);
+typedef int       (WINAPI *fn_SS)(SERVICE_STATUS_HANDLE, LPSERVICE_STATUS);
 typedef SERVICE_STATUS_HANDLE (WINAPI *fn_RH)(LPCSTR, LPHANDLER_FUNCTION);
 typedef int       (WINAPI *fn_SCD)(const SERVICE_TABLE_ENTRYA *);
 static HMODULE hAdv;
@@ -424,7 +434,7 @@ static void reply_err(const char *id, const char *why)
 {
     SB m;
     sb_init(&m);
-    sb_addf(&m, "{\"id\":\"%s\",\"ok\":false","err\":");
+    sb_addf(&m, "{\"id\":\"%s\",\"ok\":false,\"err\":\"", id);
     sb_json_bytes(&m, (const unsigned char *)why, strlen(why));
     sb_puts(&m, "\"}\n");
     send_line(g_cli_sock, m.b);
@@ -442,13 +452,14 @@ static const char *jf_find(const char *line, const char *key, JF *out)
     size_t kl;
     out->found = 0;
     kl = strlen(key);
-    if (kl >= sizeof(pat) - 2) return 0;
-    strcpy(pat, "\"");
-    strncpy(pat + 1, key, kl);
+    if (kl >= sizeof(pat) - 4) return 0;
+    pat[0] = '"';
+    memcpy(pat + 1, key, kl);
     pat[1 + kl] = '"';
+    pat[2 + kl] = 0;
     p = strstr(line, pat);
     if (!p) return 0;
-    p += strlen(pat);
+    p += 2 + kl;
     while (*p == ' ' || *p == '\t') p++;
     if (*p != ':') return 0;
     p++;
@@ -944,7 +955,7 @@ static void op_put_begin(const char *line, SOCKET c, const char *id)
     {
         SB m;
         sb_init(&m);
-        sb_addf(&m, "{\"id\":\"%s\",\"ok\":true,\"staging\":\"");
+        sb_addf(&m, "{\"id\":\"%s\",\"ok\":true,\"staging\":\"", id);
         sb_json_bytes(&m, (const unsigned char *)tmpp, strlen(tmpp));
         sb_addf(&m, "\"}\n");
         send_line(c, m.b);
@@ -1181,7 +1192,6 @@ static int open_listener(void)
 {
     struct sockaddr_in a;
     int optv = 1;
-    unsigned long nonblock = 1;
 
     g_listen_sock = W.socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_sock == (SOCKET)~0)
@@ -1200,10 +1210,8 @@ static int open_listener(void)
         log_line("bind() failed - is the port already in use?");
         return 0;
     }
-    if (W.listen(g_listen_sock, SOMAXCONN) == SOCKET_ERROR)
+    if (W.listen(g_listen_sock, 5) == SOCKET_ERROR)
         return 0;
-    /* non-blocking accept so the service loop can check the stop event */
-    W.ioctlsocket(g_listen_sock, FIONBIO, &nonblock);
     return 1;
 }
 
@@ -1213,15 +1221,20 @@ static void serve_loop(void)
     {
         SOCKET c;
         struct sockaddr_in ca;
-        int cla = sizeof(ca);
+        int cla;
 
-        if (g_stopEvt && WaitForSingleObject(g_stopEvt, 100) == WAIT_OBJECT_0)
+        if (g_listen_sock == (SOCKET)~0)   /* listener was closed on stop */
             break;
         cla = sizeof(ca);
         c = W.accept(g_listen_sock, (struct sockaddr *)&ca, &cla);
         if (c == (SOCKET)~0)
         {
-            if (g_stopEvt && WaitForSingleObject(g_stopEvt, 0) == WAIT_OBJECT_0)
+            /* accept failed: either the stop handler closed the listener, or
+             * it was transient.  Check the stop event, then retry/back off. */
+            if (g_stopEvt &&
+                WaitForSingleObject(g_stopEvt, 0) == WAIT_OBJECT_0)
+                break;
+            if (g_listen_sock == (SOCKET)~0)
                 break;
             Sleep(50);
             continue;
@@ -1245,6 +1258,13 @@ static int WINAPI svc_ctrl(DWORD code)
     if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN)
     {
         if (g_stopEvt) SetEvent(g_stopEvt);
+        /* wake a blocking accept() so the serve loop sees the stop event and
+         * unwinds; the loop re-checks g_listen_sock == INVALID before looping */
+        if (g_listen_sock != (SOCKET)~0 && W.closesocket)
+        {
+            W.closesocket(g_listen_sock);
+            g_listen_sock = (SOCKET)~0;
+        }
         g_stat.dwCurrentState = SERVICE_STOP_PENDING;
         g_stat.dwWaitHint = 3000;
         if (z_SetStat) z_SetStat(g_hstat, &g_stat);
@@ -1341,7 +1361,7 @@ static int install_service(void)
     CloseHandle(sv);
     {
         /* start it now so the agent is live right away */
-        sv = z_OpenSvc(scm, SVC_KEY, SERVICE_START | SERVICE_STOP | QUERY_STATUS);
+        sv = z_OpenSvc(scm, SVC_KEY, SERVICE_ALL_ACCESS);
         if (sv)
         {
             SERVICE_STATUS ss;
@@ -1370,7 +1390,7 @@ static int uninstall_service(void)
     if (!load_advapi()) return 1;
     scm = z_OpenSCM(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) return 1;
-    sv = z_OpenSvc(scm, SVC_KEY, SERVICE_STOP | DELETE | QUERY_STATUS);
+    sv = z_OpenSvc(scm, SVC_KEY, SERVICE_ALL_ACCESS);
     if (!sv)
     {
         if (z_QStat) z_QStat((SC_HANDLE)0, &ss);
@@ -1400,7 +1420,7 @@ static int status_service(void)
     if (!load_advapi()) return 1;
     scm = z_OpenSCM(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) return 1;
-    sv = z_OpenSvc(scm, SVC_KEY, QUERY_STATUS);
+    sv = z_OpenSvc(scm, SVC_KEY, SERVICE_QUERY_STATUS);
     if (!sv)
     {
         CloseHandle(scm);

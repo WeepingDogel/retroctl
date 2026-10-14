@@ -30,7 +30,6 @@ typedef SOCKET   (WCALL *PFN_accept)(SOCKET, struct sockaddr *, int *);
 typedef int      (WCALL *PFN_recv)(SOCKET, void *, int, int);
 typedef int      (WCALL *PFN_send)(SOCKET, const void *, int, int);
 typedef int      (WCALL *PFN_closesocket)(SOCKET);
-typedef int      (WCALL *PFN_ioctlsocket)(SOCKET, unsigned long, u_long *);
 typedef unsigned short (WCALL *PFN_htons)(unsigned short);
 typedef unsigned long  (WCALL *PFN_htonl)(unsigned long);
 typedef char    *(WCALL *PFN_inet_ntoa)(struct in_addr);
@@ -49,7 +48,6 @@ struct wsock
     PFN_recv            recv;
     PFN_send            send;
     PFN_closesocket     closesocket;
-    PFN_ioctlsocket     ioctlsocket;
     PFN_htons           htons;
     PFN_htonl           htonl;
     PFN_inet_ntoa       inet_ntoa;
