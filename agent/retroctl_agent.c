@@ -252,7 +252,7 @@ typedef SC_HANDLE (WINAPI *fn_CR)(SC_HANDLE, LPCSTR, LPCSTR, DWORD, DWORD,
 typedef int       (WINAPI *fn_St)(SC_HANDLE, int, LPCSTR);
 typedef int       (WINAPI *fn_SS)(SERVICE_STATUS_HANDLE, LPSERVICE_STATUS);
 typedef SERVICE_STATUS_HANDLE (WINAPI *fn_RH)(LPCSTR, LPHANDLER_FUNCTION);
-typedef int       (WINAPI *fn_SCD)(const SERVICE_TABLE_ENTRYA *);
+typedef int       (WINAPI *fn_SCD)(const SERVICE_TABLE_ENTRY *);
 static HMODULE hAdv;
 static fn_oSC  z_OpenSCM;
 static fn_oSV  z_OpenSvc;
