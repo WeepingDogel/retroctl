@@ -36,6 +36,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
+
+/* vsnprintf is C99; very old C89 MinGW toolchains may omit its prototype,
+ * which would make the call in sb_addf() an implicit (and, under -Werror,
+ * failing) declaration.  A matching redeclaration is legal when the header
+ * already declares it, so gate it off in that case. */
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+#endif
 
 /* some very old MinGW builds of <windows.h> do not export the service
  * control pointer typedef; provide a safe fallback so the advapi32
@@ -52,7 +61,7 @@
 #define LPSERVICE_MAIN_FUNCTIONA DWORD (WINAPI *)(DWORD, LPSTR *)
 #endif
 
-#define AGENT_VER  "1.0.0"
+#define AGENT_VER  "1.0.1"
 #define DEF_PORT   46911
 #define DEF_TOKEN  "changeme"
 #define SVC_KEY    "retroctl_agent"
@@ -133,13 +142,20 @@ static void sb_put(SB *s, const char *str, size_t len)
     s->b[s->n] = 0;
 }
 static void sb_puts(SB *s, const char *str) { sb_put(s, str, strlen(str)); }
+/* Bounded: format into a 2 KB stack buffer via vsnprintf.  Callers MUST NOT
+ * route unbounded payloads (a whole b64 chunk, say) through here - append
+ * those with sb_put() instead.  The original unbounded vsprintf() is what
+ * let one large `exec` output smash the stack and crash the service. */
 static void sb_addf(SB *s, const char *fmt, ...)
 {
     va_list ap;
     char tmp[2048];
+    int n;
     va_start(ap, fmt);
-    vsprintf(tmp, fmt, ap);
+    n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
+    if (n < 0 || (unsigned long)n >= sizeof(tmp))
+        tmp[sizeof(tmp) - 1] = 0;   /* C99 truncates at 2047; clamp the NUL */
     sb_puts(s, tmp);
 }
 static void sb_addc(SB *s, char c)
@@ -192,7 +208,11 @@ static int b64enc(const unsigned char *in, size_t n, char *out)
         out += 4;
     }
     *out = 0;
-    return (int)strlen(out);
+    /* b64 length is a pure function of the input size: ceil(n/3)*4.  The old
+     * `strlen(out)` here returned 0 because `out` had already advanced past
+     * the payload into the NUL - every caller that ignored the return value
+     * was fine, but sb_put(b64buf, blen) silently emitted an empty payload. */
+    return (int)(((n + 2) / 3) * 4);
 }
 
 /* --------------------- runtime symbol resolution -------------------------- */
@@ -253,6 +273,11 @@ typedef int       (WINAPI *fn_St)(SC_HANDLE, int, LPCSTR);
 typedef int       (WINAPI *fn_SS)(SERVICE_STATUS_HANDLE, LPSERVICE_STATUS);
 typedef SERVICE_STATUS_HANDLE (WINAPI *fn_RH)(LPCSTR, LPHANDLER_FUNCTION);
 typedef int       (WINAPI *fn_SCD)(const SERVICE_TABLE_ENTRY *);
+typedef LONG      (WINAPI *fn_RegOpenEx)(HKEY, const char *, DWORD, DWORD,
+                                         HKEY *);
+typedef LONG      (WINAPI *fn_RegSetVal)(HKEY, const char *, DWORD, DWORD,
+                                         const void *, DWORD);
+typedef LONG      (WINAPI *fn_RegClose)(HKEY);
 static HMODULE hAdv;
 static fn_oSC  z_OpenSCM;
 static fn_oSV  z_OpenSvc;
@@ -264,6 +289,9 @@ static fn_St   z_StartSvc;
 static fn_SS   z_SetStat;
 static fn_RH   z_RegHandler;
 static fn_SCD  z_ScDispatcher;
+static fn_RegOpenEx z_RegOpenEx;
+static fn_RegSetVal z_RegSetVal;
+static fn_RegClose  z_RegClose;
 static int load_advapi(void)
 {
     hAdv = LoadLibraryA("advapi32.dll");
@@ -278,6 +306,9 @@ static int load_advapi(void)
     z_SetStat     = (fn_SS)   GetProcAddress(hAdv, "SetServiceStatus");
     z_RegHandler  = (fn_RH)   GetProcAddress(hAdv, "RegisterServiceCtrlHandlerA");
     z_ScDispatcher= (fn_SCD)  GetProcAddress(hAdv, "StartServiceCtrlDispatcherA");
+    z_RegOpenEx   = (fn_RegOpenEx) GetProcAddress(hAdv, "RegOpenKeyExA");
+    z_RegSetVal   = (fn_RegSetVal) GetProcAddress(hAdv, "RegSetValueExA");
+    z_RegClose    = (fn_RegClose)  GetProcAddress(hAdv, "RegCloseHandle");
     return z_OpenSCM && z_QStat && z_SetStat && z_RegHandler && z_CreateSvc;
 }
 
@@ -568,7 +599,7 @@ static void op_exec(const char *line, SOCKET c, const char *id)
     char tmppath[MAX_PATH];
     char fullcmd[8192];
     char tmpbase[MAX_PATH];
-    char b64buf[EXEC_CHUNK * 4 + 8];
+    static char b64buf[EXEC_CHUNK * 4 + 8];  /* static: ~131 KB off the stack */
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     DWORD exitcode = 0;
@@ -577,8 +608,9 @@ static void op_exec(const char *line, SOCKET c, const char *id)
     long waitres;
     int timed_out = 0;
     size_t raw;
-    unsigned char rb[EXEC_CHUNK];
+    static unsigned char rb[EXEC_CHUNK];      /* static: 32 KB off the stack */
     SB m;
+    long total_bytes = 0;
 
     jf_get_str(line, "cmd", &cmd);
     jf_get_str(line, "cwd", &cwd);
@@ -628,18 +660,23 @@ static void op_exec(const char *line, SOCKET c, const char *id)
     GetExitCodeProcess(pi.hProcess, &exitcode);
     CloseHandle(pi.hProcess);
 
-    /* stream the captured output */
+    /* stream the captured output.  The b64 payload goes through sb_put()
+     * (heap, unbounded) - NEVER sb_addf(): that vsprintfed the whole chunk
+     * into a 2 KB stack buffer, so one large output (a 1914-byte `dir`
+     * listing -> 2552 b64 chars) smashed the stack and crashed the service. */
     f = fopen(tmppath, "rb");
     m.b = 0;
     while (f && (raw = fread(rb, 1, EXEC_CHUNK, f)) > 0)
     {
         int blen = b64enc(rb, raw, b64buf);
-        (void)blen;
         sb_init(&m);
-        sb_addf(&m, "{\"id\":\"%s\",\"type\":\"out\",\"b64\":\"%s\"}\n", id, b64buf);
+        sb_addf(&m, "{\"id\":\"%s\",\"type\":\"out\",\"b64\":\"", id);
+        sb_put(&m, b64buf, (size_t)blen);
+        sb_puts(&m, "\"}\n");
         send_line(c, m.b);
         free(m.b);
         m.b = 0;
+        total_bytes += (long)raw;
     }
     if (f) fclose(f);
 
@@ -651,6 +688,14 @@ static void op_exec(const char *line, SOCKET c, const char *id)
     sb_puts(&m, "}\n");
     send_line(c, m.b);
     free(m.b);
+
+    {
+        char lg[200];
+        sprintf(lg, "exec '%.80s' code=%ld out=%ldB%s", cmd,
+                (long)(timed_out ? -1 : exitcode), total_bytes,
+                timed_out ? " (timed_out)" : "");
+        log_line(lg);
+    }
 
     DeleteFileA(tmppath);
     if (cmd) free(cmd);
@@ -1071,8 +1116,8 @@ static void op_get(const char *line, SOCKET c, const char *id)
 {
     char *path = 0;
     FILE *f;
-    unsigned char raw[PUT_CHUNK];
-    char b64buf[PUT_CHUNK * 4 + 8];
+    static unsigned char raw[PUT_CHUNK];      /* static: 64 KB off the stack */
+    static char b64buf[PUT_CHUNK * 4 + 8];    /* static: 256 KB off the stack */
     size_t n;
 
     jf_get_str(line, "path", &path);
@@ -1086,12 +1131,12 @@ static void op_get(const char *line, SOCKET c, const char *id)
     }
     while ((n = fread(raw, 1, PUT_CHUNK, f)) > 0)
     {
-        int blen = b64enc(raw, n, b64buf);
+        int blen = (int)b64enc(raw, n, b64buf);
         SB m;
-        (void)blen;
         sb_init(&m);
-        sb_addf(&m, "{\"id\":\"%s\",\"type\":\"getchunk\",\"b64\":\"%s\"}\n",
-                id, b64buf);
+        sb_addf(&m, "{\"id\":\"%s\",\"type\":\"getchunk\",\"b64\":\"", id);
+        sb_put(&m, b64buf, (size_t)blen);
+        sb_puts(&m, "\"}\n");
         send_line(c, m.b);
         free(m.b);
     }
@@ -1379,6 +1424,35 @@ static int run_service(void)
 }
 
 /* --------------------------- install / uninstall ------------------------- */
+/* Self-heal: Win2000's SCM reads a single `ServiceFailure` REG_BINARY value
+ * (not the newer RecoveryActions) to decide what to do when a service dies.
+ * Ask it to RESTART the service after its first and second failures, so a
+ * crash brings the agent back on its own instead of staying down.  Best
+ * effort: if the key/value can't be written we log and move on - the service
+ * still runs normally. */
+static void set_service_recovery(void)
+{
+    HKEY hk = (HKEY)0;
+    char subkey[160];
+    static const unsigned char sf[26] = {
+        0, 0, 0, 0,              /* dwResetPeriod = 0 */
+        0,                       /* lpszzRebootMsg = "" */
+        0,                       /* lpszShutdownMsg = "" */
+        2, 0, 0, 0,             /* cActions = 2 */
+        3, 0, 0, 0, 0, 0, 0, 0, /* action[0]: SERVICE_RESTART_ACTION, 0 s */
+        3, 0, 0, 0, 0, 0, 0, 0  /* action[1]: SERVICE_RESTART_ACTION, 0 s */
+    };
+    if (!z_RegOpenEx || !z_RegSetVal || !z_RegClose)
+        return;
+    sprintf(subkey, "SYSTEM\\CurrentControlSet\\Services\\%s", SVC_KEY);
+    if (z_RegOpenEx(HKEY_LOCAL_MACHINE, subkey, 0, KEY_WRITE, &hk) != 0 ||
+        !hk)
+        return;
+    z_RegSetVal(hk, "ServiceFailure", 0, REG_BINARY, sf, sizeof(sf));
+    z_RegClose(hk);
+    log_line("self-heal: SCM will auto-restart the service on failure");
+}
+
 static int install_service(void)
 {
     SC_HANDLE scm, sv;
@@ -1402,13 +1476,11 @@ static int install_service(void)
                      SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                      SERVICE_AUTO_START, SERVICE_ERROR_IGNORE,
                      binpath, NULL, NULL, NULL, NULL, 0);
-    if (!sv)
-    {
-        log_line("CreateService failed (service may already exist)");
-        CloseHandle(scm);
-        return 1;
-    }
-    CloseHandle(sv);
+    if (sv)
+        CloseHandle(sv);
+    else
+        log_line("service not (re)created (already exists?) - continuing");
+    set_service_recovery();
     {
         /* start it now so the agent is live right away */
         sv = z_OpenSvc(scm, SVC_KEY, SERVICE_ALL_ACCESS);
